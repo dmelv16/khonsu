@@ -99,12 +99,12 @@ class BusFlipDetector:
 
 class BusFlipProcessor:
     """
-    Main processor for detecting, removing, and tracking bus flips across parquet data.
+    Main processor for detecting, removing, and tracking bus flips across CSV data.
     """
     
-    def __init__(self, parquet_path: str, test_case_dir: str, 
+    def __init__(self, bus_logs_dir: str, test_case_dir: str, 
                  requirement_lookup_path: str, output_dir: str = "./output"):
-        self.parquet_path = Path(parquet_path)
+        self.bus_logs_dir = Path(bus_logs_dir)
         self.test_case_dir = Path(test_case_dir)
         self.requirement_lookup_path = Path(requirement_lookup_path)
         self.output_dir = Path(output_dir)
@@ -126,21 +126,77 @@ class BusFlipProcessor:
         self._load_test_cases()
         self._load_requirement_lookup()
         self._diagnose_data()
-        self._process_parquet()
+        self._process_bus_logs()
         self._save_outputs()
         
         print("\n" + "=" * 60)
         print("PROCESSING COMPLETE")
         print("=" * 60)
     
+    def _parse_bus_log_filename(self, filename: str) -> dict:
+        """
+        Parse bus log filename to extract unit_id, station, save.
+        
+        Format: unit_id_station_save_rtXX.csv
+        Examples: 
+            ABC123_L1_001_rt01.csv -> unit_id=ABC123, station=L1, save=001
+            ABC123_L1_1_rt01.csv   -> unit_id=ABC123, station=L1, save=1
+            ABC123_L1_100_rt01.csv -> unit_id=ABC123, station=L1, save=100
+            MY_UNIT_01_L2_56_rt02.csv -> unit_id=MY_UNIT_01, station=L2, save=56
+        
+        Station mapping for rt suffix:
+        - L1/R1 -> rt01
+        - L2/R2 -> rt02
+        - etc.
+        """
+        # Remove .csv extension
+        name = filename.replace('.csv', '').replace('.CSV', '')
+        
+        # Split from the right to handle unit_ids that might contain underscores
+        # Format: unit_id_station_save_rtXX
+        # We need exactly 3 splits from the right: rtXX, save, station, then unit_id is the rest
+        parts = name.rsplit('_', 3)
+        
+        if len(parts) >= 4:
+            # Standard format: unit_id_station_save_rtXX
+            unit_id = parts[0]
+            station = parts[1]
+            save = parts[2]
+            rt_suffix = parts[3]  # e.g., "rt01"
+        elif len(parts) == 3:
+            # Fallback: might be missing rt suffix or different format
+            # Try to detect if last part is rtXX
+            if parts[2].lower().startswith('rt'):
+                # Format: unit_id_station_rtXX (no save?)
+                print(f"    WARNING: Unexpected format (no save?): {filename}")
+                return None
+            else:
+                # Format: unit_id_station_save (no rt suffix)
+                unit_id = parts[0]
+                station = parts[1]
+                save = parts[2]
+                rt_suffix = None
+        else:
+            print(f"    WARNING: Could not parse filename: {filename}")
+            return None
+        
+        # Normalize save - keep as string but strip whitespace
+        # Handles: "1", "01", "001", "56", "100", etc.
+        save = str(save).strip()
+        
+        return {
+            'unit_id': unit_id.strip(),
+            'station': station.strip(),
+            'save': save,
+            'rt_suffix': rt_suffix
+        }
+    
     def _load_test_cases(self):
         """
         Load all test case source files.
         
-        Expected columns in source CSVs:
-        - timestamp_start: Start time of test case execution
-        - timestamp_end: End time of test case execution  
-        - unit_id, station, save: Identifiers to match with parquet data
+        Handles combined test cases like "UYP1-2_02&TRTY-0098_01_Sources.csv"
+        by splitting them into individual test cases for requirement lookup.
         """
         print("\n[1/5] Loading test case sources...")
         
@@ -164,20 +220,36 @@ class BusFlipProcessor:
                     continue
                 
                 # Parse test case name from filename
+                # Remove "_Sources.csv" to get the full identifier
                 full_name = f.stem.replace("_Sources", "")
+                
+                # Extract instance number (last _XX where XX is digits)
+                # Handle: "UYP1-2_02&TRTY-0098_01" -> combined="UYP1-2_02&TRTY-0098", instance="01"
                 parts = full_name.rsplit('_', 1)
                 
                 if len(parts) == 2 and parts[1].isdigit():
-                    test_case_combined = parts[0]
-                    instance = parts[1]
+                    test_case_combined = parts[0]  # e.g., "UYP1-2_02&TRTY-0098"
+                    instance = parts[1]             # e.g., "01"
                 else:
                     test_case_combined = full_name
                     instance = "01"
+                
+                # Split combined test cases on '&' and remove instance suffixes
+                # "UYP1-2_02&TRTY-0098_01" -> ["UYP1-2", "TRTY-0098"]
+                individual_test_cases = []
+                for tc in test_case_combined.split('&'):
+                    tc = tc.strip()
+                    if not tc:
+                        continue
+                    # Remove trailing _XX instance suffix (e.g., _02, _01)
+                    tc_clean = re.sub(r'_\d+
                 
                 df['test_case_combined'] = test_case_combined
                 df['test_case_instance'] = instance
                 df['test_case_full'] = full_name
                 df['source_file'] = f.name
+                # Store the split individual test cases as a list (for requirement lookup)
+                df['individual_test_cases'] = [individual_test_cases] * len(df)
                 
                 # Normalize identifier columns to strings for matching
                 df['unit_id'] = df['unit_id'].astype(str).str.strip()
@@ -185,14 +257,23 @@ class BusFlipProcessor:
                 df['save'] = df['save'].astype(str).str.strip()
                 
                 dfs.append(df)
-                print(f"  Loaded: {f.name} ({len(df)} rows, test_case={test_case_combined})")
+                print(f"  Loaded: {f.name}")
+                print(f"    -> Combined: {test_case_combined}")
+                print(f"    -> Individual test cases: {individual_test_cases}")
+                print(f"    -> Rows: {len(df)}")
                 
             except Exception as e:
                 print(f"  ERROR loading {f.name}: {e}")
         
         if dfs:
             self.test_cases = pd.concat(dfs, ignore_index=True)
-            print(f"  Total test case entries: {len(self.test_cases)}")
+            print(f"\n  Total test case entries: {len(self.test_cases)}")
+            
+            # Show all unique individual test cases found
+            all_individual = set()
+            for tc_list in self.test_cases['individual_test_cases']:
+                all_individual.update(tc_list)
+            print(f"  Unique individual test cases: {sorted(all_individual)}")
         else:
             self.test_cases = pd.DataFrame()
             print("  WARNING: No valid test case data loaded")
@@ -227,95 +308,125 @@ class BusFlipProcessor:
         
         self.requirement_lookup = pd.DataFrame(expanded_rows)
         print(f"  Loaded {len(self.requirement_lookup)} requirement-test case mappings")
+        
+        if not self.requirement_lookup.empty:
+            print(f"  Unique requirements: {self.requirement_lookup['requirement'].nunique()}")
+            print(f"  Unique test cases in lookup: {self.requirement_lookup['test_case'].nunique()}")
     
     def _diagnose_data(self):
         """Print diagnostic info to help identify matching issues."""
         print("\n[3/5] Diagnosing data compatibility...")
         
-        df = pd.read_parquet(self.parquet_path)
+        # Get info from bus logs
+        bus_log_files = list(self.bus_logs_dir.glob("*.csv"))
+        print(f"\n  BUS LOGS:")
+        print(f"    Total CSV files: {len(bus_log_files)}")
         
-        # Normalize parquet identifiers
-        df['unit_id'] = df['unit_id'].astype(str).str.strip()
-        df['station'] = df['station'].astype(str).str.strip()
-        df['save'] = df['save'].astype(str).str.strip()
+        bus_log_combos = set()
+        for f in bus_log_files[:5]:  # Show first 5 as examples
+            parsed = self._parse_bus_log_filename(f.name)
+            if parsed:
+                bus_log_combos.add((parsed['unit_id'], parsed['station'], parsed['save']))
+                print(f"    Example: {f.name} -> unit_id={parsed['unit_id']}, station={parsed['station']}, save={parsed['save']}")
         
-        print("\n  PARQUET DATA:")
-        print(f"    Total rows: {len(df)}")
-        print(f"    Unique unit_ids: {sorted(df['unit_id'].unique())}")
-        print(f"    Unique stations: {sorted(df['station'].unique())}")
-        print(f"    Unique saves: {sorted(df['save'].unique())}")
-        print(f"    Timestamp range: {df['timestamp'].min():.3f} - {df['timestamp'].max():.3f}")
+        # Parse all files for combo analysis
+        for f in bus_log_files:
+            parsed = self._parse_bus_log_filename(f.name)
+            if parsed:
+                bus_log_combos.add((parsed['unit_id'], parsed['station'], parsed['save']))
+        
+        print(f"    Unique (unit_id, station, save) combos: {len(bus_log_combos)}")
         
         if not self.test_cases.empty:
             print("\n  TEST CASE SOURCES:")
             print(f"    Total entries: {len(self.test_cases)}")
-            print(f"    Unique unit_ids: {sorted(self.test_cases['unit_id'].unique())}")
-            print(f"    Unique stations: {sorted(self.test_cases['station'].unique())}")
-            print(f"    Unique saves: {sorted(self.test_cases['save'].unique())}")
             print(f"    Timestamp range: {self.test_cases['timestamp_start'].min():.3f} - {self.test_cases['timestamp_end'].max():.3f}")
-            print(f"    Test cases: {sorted(self.test_cases['test_case_combined'].unique())}")
             
-            # Check for potential mismatches
-            parquet_combos = set(zip(df['unit_id'], df['station'], df['save']))
-            tc_combos = set(zip(self.test_cases['unit_id'], self.test_cases['station'], self.test_cases['save']))
+            tc_combos = set(zip(
+                self.test_cases['unit_id'], 
+                self.test_cases['station'], 
+                self.test_cases['save']
+            ))
             
-            matching = parquet_combos & tc_combos
-            parquet_only = parquet_combos - tc_combos
-            tc_only = tc_combos - parquet_combos
+            matching = bus_log_combos & tc_combos
+            bus_only = bus_log_combos - tc_combos
+            tc_only = tc_combos - bus_log_combos
             
             print(f"\n  MATCHING ANALYSIS:")
             print(f"    Matching (unit_id, station, save) combos: {len(matching)}")
-            if parquet_only:
-                print(f"    In parquet but NOT in test cases: {parquet_only}")
-            if tc_only:
-                print(f"    In test cases but NOT in parquet: {tc_only}")
+            if bus_only and len(bus_only) <= 10:
+                print(f"    In bus logs but NOT in test cases: {bus_only}")
+            elif bus_only:
+                print(f"    In bus logs but NOT in test cases: {len(bus_only)} combos")
+            if tc_only and len(tc_only) <= 10:
+                print(f"    In test cases but NOT in bus logs: {tc_only}")
+            elif tc_only:
+                print(f"    In test cases but NOT in bus logs: {len(tc_only)} combos")
     
-    def _process_parquet(self):
-        """Process parquet data group by group, outputting ALL groups."""
-        print("\n[4/5] Processing parquet data...")
+    def _process_bus_logs(self):
+        """Process all bus log CSVs from the Bus Logs folder."""
+        print("\n[4/5] Processing bus log CSVs...")
         
-        df = pd.read_parquet(self.parquet_path)
+        bus_log_files = list(self.bus_logs_dir.glob("*.csv"))
         
-        # Normalize identifiers for consistent matching
-        df['unit_id'] = df['unit_id'].astype(str).str.strip()
-        df['station'] = df['station'].astype(str).str.strip()
-        df['save'] = df['save'].astype(str).str.strip()
+        if not bus_log_files:
+            print(f"  ERROR: No CSV files found in {self.bus_logs_dir}")
+            return
         
-        groups = list(df.groupby(['unit_id', 'station', 'save']))
-        total_groups = len(groups)
+        total_files = len(bus_log_files)
         total_flips = 0
-        groups_with_flips = 0
+        files_with_flips = 0
         
-        print(f"  Found {total_groups} groups to process")
+        print(f"  Found {total_files} CSV files to process")
         
-        for idx, ((unit_id, station, save), group) in enumerate(groups, 1):
-            processed = self._process_group(group.copy(), unit_id, station, save)
+        for idx, csv_file in enumerate(bus_log_files, 1):
+            # Parse filename to get identifiers
+            parsed = self._parse_bus_log_filename(csv_file.name)
+            if not parsed:
+                continue
             
-            # Count flips in this group
-            flip_count = (processed['bus_flip'] == 1).sum()
-            if flip_count > 0:
-                groups_with_flips += 1
-                total_flips += flip_count
+            unit_id = parsed['unit_id']
+            station = parsed['station']
+            save = parsed['save']
             
-            # Always output to cleaned_logs_dir
-            output_path = self.cleaned_logs_dir / f"{unit_id}_{station}_{save}_cleaned.csv"
-            
-            if processed['bus_flip'].isin([1, 2]).any():
-                # Remove incorrect messages, reset correct ones
-                clean_df = processed[processed['bus_flip'] != 1].copy()
-                clean_df.loc[clean_df['bus_flip'] == 2, 'bus_flip'] = 0
-            else:
-                clean_df = processed.copy()
-            
-            clean_df.to_csv(output_path, index=False)
+            try:
+                df = pd.read_csv(csv_file)
+                
+                if 'timestamp' not in df.columns:
+                    print(f"    WARNING: {csv_file.name} missing 'timestamp' column, skipping")
+                    continue
+                
+                processed = self._process_group(df.copy(), unit_id, station, save)
+                
+                # Count flips in this file
+                flip_count = (processed['bus_flip'] == 1).sum()
+                if flip_count > 0:
+                    files_with_flips += 1
+                    total_flips += flip_count
+                
+                # Always output cleaned file
+                output_filename = f"{unit_id}_{station}_{save}_cleaned.csv"
+                output_path = self.cleaned_logs_dir / output_filename
+                
+                if processed['bus_flip'].isin([1, 2]).any():
+                    clean_df = processed[processed['bus_flip'] != 1].copy()
+                    clean_df.loc[clean_df['bus_flip'] == 2, 'bus_flip'] = 0
+                else:
+                    clean_df = processed.copy()
+                
+                clean_df.to_csv(output_path, index=False)
+                
+            except Exception as e:
+                print(f"    ERROR processing {csv_file.name}: {e}")
+                continue
             
             # Progress indicator
-            if idx % 10 == 0 or idx == total_groups:
-                print(f"    Processed {idx}/{total_groups} groups...")
+            if idx % 10 == 0 or idx == total_files:
+                print(f"    Processed {idx}/{total_files} files...")
         
         print(f"\n  Summary:")
-        print(f"    Total groups processed: {total_groups}")
-        print(f"    Groups with flips: {groups_with_flips}")
+        print(f"    Total files processed: {total_files}")
+        print(f"    Files with flips: {files_with_flips}")
         print(f"    Total flips detected: {total_flips}")
         print(f"    Cleaned logs saved to: {self.cleaned_logs_dir}")
     
@@ -335,7 +446,11 @@ class BusFlipProcessor:
         """Record detailed information about a detected flip."""
         row = df.iloc[flip_idx]
         msg_type = self._extract_msg_type(row.get('decoded_description', ''))
-        test_case = self._find_test_case(row['timestamp'], unit_id, station, save)
+        
+        # Get test case info (both combined and individual)
+        test_case_combined, individual_test_cases = self._find_test_case(
+            row['timestamp'], unit_id, station, save
+        )
         
         # Find the correct message in the pair
         correct_idx = None
@@ -359,7 +474,8 @@ class BusFlipProcessor:
             'group_index': flip_idx,
             'incorrect_bus': row['bus'],
             'correct_bus': correct_bus,
-            'test_case': test_case
+            'test_case_combined': test_case_combined,
+            'individual_test_cases': individual_test_cases
         })
     
     def _extract_msg_type(self, desc: str) -> Optional[str]:
@@ -370,17 +486,17 @@ class BusFlipProcessor:
         return match.group(1) if match else None
     
     def _find_test_case(self, timestamp: float, unit_id: str, 
-                        station: str, save: str) -> Optional[str]:
+                        station: str, save: str) -> Tuple[Optional[str], list]:
         """
         Find which test case was running at a given timestamp.
         
-        Matches on unit_id, station, save AND checks if timestamp
-        falls within the test case's execution window.
+        Returns:
+            Tuple of (combined_name, list_of_individual_test_cases)
+            e.g., ("UYP1-2_02&TRTY-0098", ["UYP1-2_02", "TRTY-0098"])
         """
         if self.test_cases is None or self.test_cases.empty:
-            return None
+            return None, []
         
-        # Filter for matching location AND timestamp within range
         matches = self.test_cases[
             (self.test_cases['unit_id'] == str(unit_id)) &
             (self.test_cases['station'] == str(station)) &
@@ -390,10 +506,12 @@ class BusFlipProcessor:
         ]
         
         if matches.empty:
-            return None
+            return None, []
         
-        # Return the combined test case name (without instance suffix)
-        return matches.iloc[0]['test_case_combined']
+        combined = matches.iloc[0]['test_case_combined']
+        individual = matches.iloc[0]['individual_test_cases']
+        
+        return combined, individual if isinstance(individual, list) else []
     
     def _save_outputs(self):
         """Save all output files including parquet and Excel summaries."""
@@ -405,6 +523,11 @@ class BusFlipProcessor:
         
         flips_df = pd.DataFrame(self.flip_records)
         
+        # Convert individual_test_cases list to string for parquet/excel
+        flips_df['individual_test_cases_str'] = flips_df['individual_test_cases'].apply(
+            lambda x: ', '.join(x) if isinstance(x, list) else ''
+        )
+        
         # Save parquet
         parquet_path = self.output_dir / "bus_flips.parquet"
         flips_df.to_parquet(parquet_path, index=False)
@@ -415,51 +538,48 @@ class BusFlipProcessor:
         with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
             self._write_bus_flip_index(flips_df, writer)
             self._write_test_case_summary(flips_df, writer)
+            self._write_individual_test_case_summary(flips_df, writer)
             self._write_location_summary(flips_df, writer)
             self._write_msg_type_summary(flips_df, writer)
         print(f"  Saved: {excel_path}")
         
         # Print test case mapping summary
-        if 'test_case' in flips_df.columns:
-            mapped = flips_df['test_case'].notna().sum()
-            unmapped = flips_df['test_case'].isna().sum()
-            print(f"\n  Test case mapping:")
-            print(f"    Flips mapped to test cases: {mapped}")
-            print(f"    Flips without test case: {unmapped}")
-            
-            if mapped > 0:
-                print(f"    Test cases with flips: {flips_df['test_case'].dropna().unique().tolist()}")
+        mapped = flips_df['test_case_combined'].notna().sum()
+        unmapped = flips_df['test_case_combined'].isna().sum()
+        print(f"\n  Test case mapping:")
+        print(f"    Flips mapped to test cases: {mapped}")
+        print(f"    Flips without test case: {unmapped}")
+        
+        if mapped > 0:
+            print(f"    Combined test cases with flips: {flips_df['test_case_combined'].dropna().unique().tolist()}")
     
     def _write_bus_flip_index(self, flips_df: pd.DataFrame, writer):
         """Write detailed bus flip index to Excel."""
         index_df = flips_df[[
             'unit_id', 'station', 'save', 'group_index', 
             'msg_type', 'decoded_description', 'timestamp',
-            'incorrect_bus', 'correct_bus', 'test_case'
+            'incorrect_bus', 'correct_bus', 
+            'test_case_combined', 'individual_test_cases_str'
         ]].copy()
         
+        index_df = index_df.rename(columns={'individual_test_cases_str': 'individual_test_cases'})
         index_df = index_df.sort_values(['unit_id', 'station', 'save', 'group_index'])
         index_df.to_excel(writer, sheet_name='Bus Flip Index', index=False)
     
     def _write_test_case_summary(self, flips_df: pd.DataFrame, writer):
-        """Write test case summary sheets to Excel."""
-        tc_summary = flips_df.groupby('test_case').agg(
+        """Write combined test case summary to Excel."""
+        tc_summary = flips_df.groupby('test_case_combined').agg(
             total_flips=('timestamp', 'count'),
             unique_locations=('unit_id', 'nunique'),
             unique_msg_types=('msg_type', 'nunique')
         ).reset_index()
         
-        if not self.requirement_lookup.empty:
-            tc_summary['requirements'] = tc_summary['test_case'].apply(
-                self._get_requirements_for_test_case
-            )
-        
         tc_summary = tc_summary.sort_values('total_flips', ascending=False)
-        tc_summary.to_excel(writer, sheet_name='By Test Case', index=False)
+        tc_summary.to_excel(writer, sheet_name='By Combined Test Case', index=False)
         
         # Pivot table
         pivot = flips_df.pivot_table(
-            index='test_case',
+            index='test_case_combined',
             columns=['unit_id', 'station', 'save'],
             values='timestamp',
             aggfunc='count',
@@ -468,28 +588,70 @@ class BusFlipProcessor:
         pivot.columns = ['_'.join(map(str, c)) for c in pivot.columns]
         pivot.reset_index().to_excel(writer, sheet_name='Test Case by Location', index=False)
     
-    def _get_requirements_for_test_case(self, test_case: str) -> str:
-        """Get requirements for a test case, handling combined test cases."""
-        if pd.isna(test_case) or test_case == '':
+    def _write_individual_test_case_summary(self, flips_df: pd.DataFrame, writer):
+        """
+        Write summary by INDIVIDUAL test cases (split from combined).
+        
+        This properly handles "UYP1-2_02&TRTY-0098" by counting flips
+        for both UYP1-2_02 AND TRTY-0098 separately.
+        """
+        # Explode the individual test cases
+        rows = []
+        for _, row in flips_df.iterrows():
+            individual_tcs = row['individual_test_cases']
+            if isinstance(individual_tcs, list) and individual_tcs:
+                for tc in individual_tcs:
+                    rows.append({
+                        'individual_test_case': tc,
+                        'unit_id': row['unit_id'],
+                        'station': row['station'],
+                        'save': row['save'],
+                        'msg_type': row['msg_type'],
+                        'timestamp': row['timestamp']
+                    })
+        
+        if not rows:
+            # No individual test cases found
+            pd.DataFrame(columns=[
+                'individual_test_case', 'total_flips', 'unique_locations', 
+                'unique_msg_types', 'requirements'
+            ]).to_excel(writer, sheet_name='By Individual Test Case', index=False)
+            return
+        
+        individual_df = pd.DataFrame(rows)
+        
+        tc_summary = individual_df.groupby('individual_test_case').agg(
+            total_flips=('timestamp', 'count'),
+            unique_locations=('unit_id', 'nunique'),
+            unique_msg_types=('msg_type', 'nunique')
+        ).reset_index()
+        
+        # Add requirements lookup
+        if not self.requirement_lookup.empty:
+            tc_summary['requirements'] = tc_summary['individual_test_case'].apply(
+                self._get_requirements_for_single_test_case
+            )
+        
+        tc_summary = tc_summary.sort_values('total_flips', ascending=False)
+        tc_summary.to_excel(writer, sheet_name='By Individual Test Case', index=False)
+    
+    def _get_requirements_for_single_test_case(self, test_case: str) -> str:
+        """Get requirements for a single test case."""
+        if pd.isna(test_case) or test_case == '' or self.requirement_lookup.empty:
             return ''
         
-        individual_tcs = [tc.strip() for tc in str(test_case).split('&') if tc.strip()]
+        reqs = self.requirement_lookup[
+            self.requirement_lookup['test_case'] == test_case
+        ]['requirement'].tolist()
         
-        all_reqs = []
-        for tc in individual_tcs:
-            reqs = self.requirement_lookup[
-                self.requirement_lookup['test_case'] == tc
-            ]['requirement'].tolist()
-            all_reqs.extend(reqs)
-        
-        unique_reqs = list(dict.fromkeys(all_reqs))
+        unique_reqs = list(dict.fromkeys(reqs))
         return ', '.join(unique_reqs) if unique_reqs else ''
     
     def _write_location_summary(self, flips_df: pd.DataFrame, writer):
         """Write location-based summary to Excel."""
         loc_summary = flips_df.groupby(['unit_id', 'station', 'save']).agg(
             total_flips=('timestamp', 'count'),
-            unique_test_cases=('test_case', 'nunique'),
+            unique_test_cases=('test_case_combined', 'nunique'),
             unique_msg_types=('msg_type', 'nunique')
         ).reset_index().sort_values('total_flips', ascending=False)
         
@@ -500,7 +662,7 @@ class BusFlipProcessor:
         msg_summary = flips_df.groupby('msg_type').agg(
             total_flips=('timestamp', 'count'),
             unique_locations=('unit_id', 'nunique'),
-            unique_test_cases=('test_case', 'nunique')
+            unique_test_cases=('test_case_combined', 'nunique')
         ).reset_index().sort_values('total_flips', ascending=False)
         
         msg_summary.to_excel(writer, sheet_name='By Message Type', index=False)
@@ -508,7 +670,442 @@ class BusFlipProcessor:
 
 if __name__ == "__main__":
     processor = BusFlipProcessor(
-        parquet_path="bus_monitor_data.parquet",
+        bus_logs_dir="./Bus Logs",
+        test_case_dir="./Test Case Sources",
+        requirement_lookup_path="./requirement_lookup.csv",
+        output_dir="./output"
+    )
+    processor.run()
+, '', tc)
+                    individual_test_cases.append(tc_clean)
+                
+                df['test_case_combined'] = test_case_combined
+                df['test_case_instance'] = instance
+                df['test_case_full'] = full_name
+                df['source_file'] = f.name
+                # Store the split individual test cases as a list (for requirement lookup)
+                df['individual_test_cases'] = [individual_test_cases] * len(df)
+                
+                # Normalize identifier columns to strings for matching
+                df['unit_id'] = df['unit_id'].astype(str).str.strip()
+                df['station'] = df['station'].astype(str).str.strip()
+                df['save'] = df['save'].astype(str).str.strip()
+                
+                dfs.append(df)
+                print(f"  Loaded: {f.name}")
+                print(f"    -> Combined: {test_case_combined}")
+                print(f"    -> Individual test cases: {individual_test_cases}")
+                print(f"    -> Rows: {len(df)}")
+                
+            except Exception as e:
+                print(f"  ERROR loading {f.name}: {e}")
+        
+        if dfs:
+            self.test_cases = pd.concat(dfs, ignore_index=True)
+            print(f"\n  Total test case entries: {len(self.test_cases)}")
+            
+            # Show all unique individual test cases found
+            all_individual = set()
+            for tc_list in self.test_cases['individual_test_cases']:
+                all_individual.update(tc_list)
+            print(f"  Unique individual test cases: {sorted(all_individual)}")
+        else:
+            self.test_cases = pd.DataFrame()
+            print("  WARNING: No valid test case data loaded")
+    
+    def _load_requirement_lookup(self):
+        """Load requirement-to-test-case mapping."""
+        print("\n[2/5] Loading requirement lookup...")
+        
+        if not self.requirement_lookup_path.exists():
+            print(f"  WARNING: Lookup file not found: {self.requirement_lookup_path}")
+            self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
+            return
+        
+        df = pd.read_csv(self.requirement_lookup_path)
+        
+        if 'Requirement' not in df.columns or 'Test Cases' not in df.columns:
+            print(f"  WARNING: Expected columns 'Requirement' and 'Test Cases' not found")
+            self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
+            return
+        
+        expanded_rows = []
+        for _, row in df.iterrows():
+            requirement = row['Requirement']
+            test_cases_str = str(row['Test Cases']).strip()
+            
+            if pd.isna(test_cases_str) or test_cases_str in ('', 'nan'):
+                continue
+            
+            test_cases = [tc.strip() for tc in test_cases_str.split(',') if tc.strip()]
+            for tc in test_cases:
+                expanded_rows.append({'requirement': requirement, 'test_case': tc})
+        
+        self.requirement_lookup = pd.DataFrame(expanded_rows)
+        print(f"  Loaded {len(self.requirement_lookup)} requirement-test case mappings")
+        
+        if not self.requirement_lookup.empty:
+            print(f"  Unique requirements: {self.requirement_lookup['requirement'].nunique()}")
+            print(f"  Unique test cases in lookup: {self.requirement_lookup['test_case'].nunique()}")
+    
+    def _diagnose_data(self):
+        """Print diagnostic info to help identify matching issues."""
+        print("\n[3/5] Diagnosing data compatibility...")
+        
+        # Get info from bus logs
+        bus_log_files = list(self.bus_logs_dir.glob("*.csv"))
+        print(f"\n  BUS LOGS:")
+        print(f"    Total CSV files: {len(bus_log_files)}")
+        
+        bus_log_combos = set()
+        for f in bus_log_files[:5]:  # Show first 5 as examples
+            parsed = self._parse_bus_log_filename(f.name)
+            if parsed:
+                bus_log_combos.add((parsed['unit_id'], parsed['station'], parsed['save']))
+                print(f"    Example: {f.name} -> unit_id={parsed['unit_id']}, station={parsed['station']}, save={parsed['save']}")
+        
+        # Parse all files for combo analysis
+        for f in bus_log_files:
+            parsed = self._parse_bus_log_filename(f.name)
+            if parsed:
+                bus_log_combos.add((parsed['unit_id'], parsed['station'], parsed['save']))
+        
+        print(f"    Unique (unit_id, station, save) combos: {len(bus_log_combos)}")
+        
+        if not self.test_cases.empty:
+            print("\n  TEST CASE SOURCES:")
+            print(f"    Total entries: {len(self.test_cases)}")
+            print(f"    Timestamp range: {self.test_cases['timestamp_start'].min():.3f} - {self.test_cases['timestamp_end'].max():.3f}")
+            
+            tc_combos = set(zip(
+                self.test_cases['unit_id'], 
+                self.test_cases['station'], 
+                self.test_cases['save']
+            ))
+            
+            matching = bus_log_combos & tc_combos
+            bus_only = bus_log_combos - tc_combos
+            tc_only = tc_combos - bus_log_combos
+            
+            print(f"\n  MATCHING ANALYSIS:")
+            print(f"    Matching (unit_id, station, save) combos: {len(matching)}")
+            if bus_only and len(bus_only) <= 10:
+                print(f"    In bus logs but NOT in test cases: {bus_only}")
+            elif bus_only:
+                print(f"    In bus logs but NOT in test cases: {len(bus_only)} combos")
+            if tc_only and len(tc_only) <= 10:
+                print(f"    In test cases but NOT in bus logs: {tc_only}")
+            elif tc_only:
+                print(f"    In test cases but NOT in bus logs: {len(tc_only)} combos")
+    
+    def _process_bus_logs(self):
+        """Process all bus log CSVs from the Bus Logs folder."""
+        print("\n[4/5] Processing bus log CSVs...")
+        
+        bus_log_files = list(self.bus_logs_dir.glob("*.csv"))
+        
+        if not bus_log_files:
+            print(f"  ERROR: No CSV files found in {self.bus_logs_dir}")
+            return
+        
+        total_files = len(bus_log_files)
+        total_flips = 0
+        files_with_flips = 0
+        
+        print(f"  Found {total_files} CSV files to process")
+        
+        for idx, csv_file in enumerate(bus_log_files, 1):
+            # Parse filename to get identifiers
+            parsed = self._parse_bus_log_filename(csv_file.name)
+            if not parsed:
+                continue
+            
+            unit_id = parsed['unit_id']
+            station = parsed['station']
+            save = parsed['save']
+            
+            try:
+                df = pd.read_csv(csv_file)
+                
+                if 'timestamp' not in df.columns:
+                    print(f"    WARNING: {csv_file.name} missing 'timestamp' column, skipping")
+                    continue
+                
+                processed = self._process_group(df.copy(), unit_id, station, save)
+                
+                # Count flips in this file
+                flip_count = (processed['bus_flip'] == 1).sum()
+                if flip_count > 0:
+                    files_with_flips += 1
+                    total_flips += flip_count
+                
+                # Always output cleaned file
+                output_filename = f"{unit_id}_{station}_{save}_cleaned.csv"
+                output_path = self.cleaned_logs_dir / output_filename
+                
+                if processed['bus_flip'].isin([1, 2]).any():
+                    clean_df = processed[processed['bus_flip'] != 1].copy()
+                    clean_df.loc[clean_df['bus_flip'] == 2, 'bus_flip'] = 0
+                else:
+                    clean_df = processed.copy()
+                
+                clean_df.to_csv(output_path, index=False)
+                
+            except Exception as e:
+                print(f"    ERROR processing {csv_file.name}: {e}")
+                continue
+            
+            # Progress indicator
+            if idx % 10 == 0 or idx == total_files:
+                print(f"    Processed {idx}/{total_files} files...")
+        
+        print(f"\n  Summary:")
+        print(f"    Total files processed: {total_files}")
+        print(f"    Files with flips: {files_with_flips}")
+        print(f"    Total flips detected: {total_flips}")
+        print(f"    Cleaned logs saved to: {self.cleaned_logs_dir}")
+    
+    def _process_group(self, df: pd.DataFrame, unit_id: str, 
+                       station: str, save: str) -> pd.DataFrame:
+        """Process a single group to detect and record flips."""
+        df = BusFlipDetector.detect_flips(df)
+        
+        flip_indices = df[df['bus_flip'] == 1].index
+        for idx in flip_indices:
+            self._record_flip(df, idx, unit_id, station, save)
+        
+        return df
+    
+    def _record_flip(self, df: pd.DataFrame, flip_idx: int, 
+                     unit_id: str, station: str, save: str):
+        """Record detailed information about a detected flip."""
+        row = df.iloc[flip_idx]
+        msg_type = self._extract_msg_type(row.get('decoded_description', ''))
+        
+        # Get test case info (both combined and individual)
+        test_case_combined, individual_test_cases = self._find_test_case(
+            row['timestamp'], unit_id, station, save
+        )
+        
+        # Find the correct message in the pair
+        correct_idx = None
+        correct_bus = None
+        
+        if flip_idx + 1 < len(df) and df.iloc[flip_idx + 1]['bus_flip'] == 2:
+            correct_idx = flip_idx + 1
+        elif flip_idx - 1 >= 0 and df.iloc[flip_idx - 1]['bus_flip'] == 2:
+            correct_idx = flip_idx - 1
+        
+        if correct_idx is not None:
+            correct_bus = df.iloc[correct_idx]['bus']
+        
+        self.flip_records.append({
+            'unit_id': unit_id,
+            'station': station,
+            'save': save,
+            'msg_type': msg_type,
+            'decoded_description': row.get('decoded_description', ''),
+            'timestamp': row['timestamp'],
+            'group_index': flip_idx,
+            'incorrect_bus': row['bus'],
+            'correct_bus': correct_bus,
+            'test_case_combined': test_case_combined,
+            'individual_test_cases': individual_test_cases
+        })
+    
+    def _extract_msg_type(self, desc: str) -> Optional[str]:
+        """Extract message type from decoded description."""
+        if pd.isna(desc):
+            return None
+        match = re.search(r'\[\s*([^\]]+)\s*\]', str(desc))
+        return match.group(1) if match else None
+    
+    def _find_test_case(self, timestamp: float, unit_id: str, 
+                        station: str, save: str) -> Tuple[Optional[str], list]:
+        """
+        Find which test case was running at a given timestamp.
+        
+        Returns:
+            Tuple of (combined_name, list_of_individual_test_cases)
+            e.g., ("UYP1-2_02&TRTY-0098", ["UYP1-2_02", "TRTY-0098"])
+        """
+        if self.test_cases is None or self.test_cases.empty:
+            return None, []
+        
+        matches = self.test_cases[
+            (self.test_cases['unit_id'] == str(unit_id)) &
+            (self.test_cases['station'] == str(station)) &
+            (self.test_cases['save'] == str(save)) &
+            (self.test_cases['timestamp_start'] <= timestamp) &
+            (self.test_cases['timestamp_end'] >= timestamp)
+        ]
+        
+        if matches.empty:
+            return None, []
+        
+        combined = matches.iloc[0]['test_case_combined']
+        individual = matches.iloc[0]['individual_test_cases']
+        
+        return combined, individual if isinstance(individual, list) else []
+    
+    def _save_outputs(self):
+        """Save all output files including parquet and Excel summaries."""
+        print("\n[5/5] Saving outputs...")
+        
+        if not self.flip_records:
+            print("  No flips detected - skipping summary generation")
+            return
+        
+        flips_df = pd.DataFrame(self.flip_records)
+        
+        # Convert individual_test_cases list to string for parquet/excel
+        flips_df['individual_test_cases_str'] = flips_df['individual_test_cases'].apply(
+            lambda x: ', '.join(x) if isinstance(x, list) else ''
+        )
+        
+        # Save parquet
+        parquet_path = self.output_dir / "bus_flips.parquet"
+        flips_df.to_parquet(parquet_path, index=False)
+        print(f"  Saved: {parquet_path}")
+        
+        # Save Excel summary
+        excel_path = self.output_dir / "bus_flip_summary.xlsx"
+        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+            self._write_bus_flip_index(flips_df, writer)
+            self._write_test_case_summary(flips_df, writer)
+            self._write_individual_test_case_summary(flips_df, writer)
+            self._write_location_summary(flips_df, writer)
+            self._write_msg_type_summary(flips_df, writer)
+        print(f"  Saved: {excel_path}")
+        
+        # Print test case mapping summary
+        mapped = flips_df['test_case_combined'].notna().sum()
+        unmapped = flips_df['test_case_combined'].isna().sum()
+        print(f"\n  Test case mapping:")
+        print(f"    Flips mapped to test cases: {mapped}")
+        print(f"    Flips without test case: {unmapped}")
+        
+        if mapped > 0:
+            print(f"    Combined test cases with flips: {flips_df['test_case_combined'].dropna().unique().tolist()}")
+    
+    def _write_bus_flip_index(self, flips_df: pd.DataFrame, writer):
+        """Write detailed bus flip index to Excel."""
+        index_df = flips_df[[
+            'unit_id', 'station', 'save', 'group_index', 
+            'msg_type', 'decoded_description', 'timestamp',
+            'incorrect_bus', 'correct_bus', 
+            'test_case_combined', 'individual_test_cases_str'
+        ]].copy()
+        
+        index_df = index_df.rename(columns={'individual_test_cases_str': 'individual_test_cases'})
+        index_df = index_df.sort_values(['unit_id', 'station', 'save', 'group_index'])
+        index_df.to_excel(writer, sheet_name='Bus Flip Index', index=False)
+    
+    def _write_test_case_summary(self, flips_df: pd.DataFrame, writer):
+        """Write combined test case summary to Excel."""
+        tc_summary = flips_df.groupby('test_case_combined').agg(
+            total_flips=('timestamp', 'count'),
+            unique_locations=('unit_id', 'nunique'),
+            unique_msg_types=('msg_type', 'nunique')
+        ).reset_index()
+        
+        tc_summary = tc_summary.sort_values('total_flips', ascending=False)
+        tc_summary.to_excel(writer, sheet_name='By Combined Test Case', index=False)
+        
+        # Pivot table
+        pivot = flips_df.pivot_table(
+            index='test_case_combined',
+            columns=['unit_id', 'station', 'save'],
+            values='timestamp',
+            aggfunc='count',
+            fill_value=0
+        )
+        pivot.columns = ['_'.join(map(str, c)) for c in pivot.columns]
+        pivot.reset_index().to_excel(writer, sheet_name='Test Case by Location', index=False)
+    
+    def _write_individual_test_case_summary(self, flips_df: pd.DataFrame, writer):
+        """
+        Write summary by INDIVIDUAL test cases (split from combined).
+        
+        This properly handles "UYP1-2_02&TRTY-0098" by counting flips
+        for both UYP1-2_02 AND TRTY-0098 separately.
+        """
+        # Explode the individual test cases
+        rows = []
+        for _, row in flips_df.iterrows():
+            individual_tcs = row['individual_test_cases']
+            if isinstance(individual_tcs, list) and individual_tcs:
+                for tc in individual_tcs:
+                    rows.append({
+                        'individual_test_case': tc,
+                        'unit_id': row['unit_id'],
+                        'station': row['station'],
+                        'save': row['save'],
+                        'msg_type': row['msg_type'],
+                        'timestamp': row['timestamp']
+                    })
+        
+        if not rows:
+            # No individual test cases found
+            pd.DataFrame(columns=[
+                'individual_test_case', 'total_flips', 'unique_locations', 
+                'unique_msg_types', 'requirements'
+            ]).to_excel(writer, sheet_name='By Individual Test Case', index=False)
+            return
+        
+        individual_df = pd.DataFrame(rows)
+        
+        tc_summary = individual_df.groupby('individual_test_case').agg(
+            total_flips=('timestamp', 'count'),
+            unique_locations=('unit_id', 'nunique'),
+            unique_msg_types=('msg_type', 'nunique')
+        ).reset_index()
+        
+        # Add requirements lookup
+        if not self.requirement_lookup.empty:
+            tc_summary['requirements'] = tc_summary['individual_test_case'].apply(
+                self._get_requirements_for_single_test_case
+            )
+        
+        tc_summary = tc_summary.sort_values('total_flips', ascending=False)
+        tc_summary.to_excel(writer, sheet_name='By Individual Test Case', index=False)
+    
+    def _get_requirements_for_single_test_case(self, test_case: str) -> str:
+        """Get requirements for a single test case."""
+        if pd.isna(test_case) or test_case == '' or self.requirement_lookup.empty:
+            return ''
+        
+        reqs = self.requirement_lookup[
+            self.requirement_lookup['test_case'] == test_case
+        ]['requirement'].tolist()
+        
+        unique_reqs = list(dict.fromkeys(reqs))
+        return ', '.join(unique_reqs) if unique_reqs else ''
+    
+    def _write_location_summary(self, flips_df: pd.DataFrame, writer):
+        """Write location-based summary to Excel."""
+        loc_summary = flips_df.groupby(['unit_id', 'station', 'save']).agg(
+            total_flips=('timestamp', 'count'),
+            unique_test_cases=('test_case_combined', 'nunique'),
+            unique_msg_types=('msg_type', 'nunique')
+        ).reset_index().sort_values('total_flips', ascending=False)
+        
+        loc_summary.to_excel(writer, sheet_name='By Location', index=False)
+    
+    def _write_msg_type_summary(self, flips_df: pd.DataFrame, writer):
+        """Write message type summary to Excel."""
+        msg_summary = flips_df.groupby('msg_type').agg(
+            total_flips=('timestamp', 'count'),
+            unique_locations=('unit_id', 'nunique'),
+            unique_test_cases=('test_case_combined', 'nunique')
+        ).reset_index().sort_values('total_flips', ascending=False)
+        
+        msg_summary.to_excel(writer, sheet_name='By Message Type', index=False)
+
+
+if __name__ == "__main__":
+    processor = BusFlipProcessor(
+        bus_logs_dir="./Bus Logs",
         test_case_dir="./Test Case Sources",
         requirement_lookup_path="./requirement_lookup.csv",
         output_dir="./output"
