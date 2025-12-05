@@ -360,8 +360,8 @@ class BusFlipProcessor:
                 output_path = self.cleaned_logs_dir / output_filename
                 
                 if processed['bus_flip'].isin([1, 2]).any():
+                    # Remove incorrect messages (bus_flip == 1), keep bus_flip == 2 to mark corrected flips
                     clean_df = processed[processed['bus_flip'] != 1].copy()
-                    clean_df.loc[clean_df['bus_flip'] == 2, 'bus_flip'] = 0
                 else:
                     clean_df = processed.copy()
                 
@@ -660,22 +660,51 @@ class BusFlipProcessor:
     
     def _write_location_summary(self, flips_df: pd.DataFrame, writer):
         """Write location-based summary to Excel."""
-        loc_summary = flips_df.groupby(['unit_id', 'station', 'save']).agg(
-            total_flips=('timestamp', 'count'),
-            unique_test_cases=('test_case', 'nunique'),
-            unique_msg_types=('msg_type', 'nunique')
-        ).reset_index().sort_values('total_flips', ascending=False)
+        if flips_df.empty:
+            pd.DataFrame(columns=[
+                'unit_id', 'station', 'save', 'total_flips',
+                'unique_test_cases', 'unique_msg_types'
+            ]).to_excel(writer, sheet_name='By Location', index=False)
+            return
         
+        # Deduplicate to get actual unique flips
+        unique_flips = flips_df.drop_duplicates(subset=['grouping', 'timestamp', 'group_index'])
+        
+        loc_summary = unique_flips.groupby(['unit_id', 'station', 'save']).agg(
+            total_flips=('timestamp', 'count'),
+            unique_msg_types=('msg_type', 'nunique')
+        ).reset_index()
+        
+        # Get unique test cases per location from original (non-deduplicated) data
+        tc_counts = flips_df.groupby(['unit_id', 'station', 'save'])['test_case'].nunique().reset_index()
+        tc_counts.columns = ['unit_id', 'station', 'save', 'unique_test_cases']
+        
+        loc_summary = loc_summary.merge(tc_counts, on=['unit_id', 'station', 'save'], how='left')
+        loc_summary = loc_summary.sort_values('total_flips', ascending=False)
         loc_summary.to_excel(writer, sheet_name='By Location', index=False)
     
     def _write_msg_type_summary(self, flips_df: pd.DataFrame, writer):
         """Write message type summary to Excel."""
-        msg_summary = flips_df.groupby('msg_type').agg(
-            total_flips=('timestamp', 'count'),
-            unique_locations=('unit_id', 'nunique'),
-            unique_test_cases=('test_case', 'nunique')
-        ).reset_index().sort_values('total_flips', ascending=False)
+        if flips_df.empty:
+            pd.DataFrame(columns=[
+                'msg_type', 'total_flips', 'unique_locations', 'unique_test_cases'
+            ]).to_excel(writer, sheet_name='By Message Type', index=False)
+            return
         
+        # Deduplicate to get actual unique flips
+        unique_flips = flips_df.drop_duplicates(subset=['grouping', 'timestamp', 'group_index'])
+        
+        msg_summary = unique_flips.groupby('msg_type').agg(
+            total_flips=('timestamp', 'count'),
+            unique_locations=('grouping', 'nunique')
+        ).reset_index()
+        
+        # Get unique test cases per msg_type from original (non-deduplicated) data
+        tc_counts = flips_df.groupby('msg_type')['test_case'].nunique().reset_index()
+        tc_counts.columns = ['msg_type', 'unique_test_cases']
+        
+        msg_summary = msg_summary.merge(tc_counts, on='msg_type', how='left')
+        msg_summary = msg_summary.sort_values('total_flips', ascending=False)
         msg_summary.to_excel(writer, sheet_name='By Message Type', index=False)
 
 
