@@ -233,7 +233,7 @@ class BusFlipProcessor:
         which system requirements may be impacted by bus flip issues.
         
         Expects CSV with columns: "Requirement" and "Test Cases"
-        Handles multiple test cases in a single cell (e.g., "TC-001, TC-002, TC-003").
+        Handles multiple test cases in a single cell (e.g., "UYP-0054, UYP123, TYUI-0098").
         """
         if not self.requirement_lookup_path.exists():
             self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
@@ -251,10 +251,13 @@ class BusFlipProcessor:
         expanded_rows = []
         for _, row in df.iterrows():
             requirement = row['Requirement']
-            test_cases_str = str(row['Test Cases'])
+            test_cases_str = str(row['Test Cases']).strip()
             
-            # Split on comma, space, or both
-            test_cases = [tc.strip() for tc in test_cases_str.replace(',', ' ').split() if tc.strip()]
+            if pd.isna(test_cases_str) or test_cases_str == '' or test_cases_str == 'nan':
+                continue
+            
+            # Split on comma first, then strip each test case
+            test_cases = [tc.strip() for tc in test_cases_str.split(',') if tc.strip()]
             
             for tc in test_cases:
                 expanded_rows.append({
@@ -263,6 +266,11 @@ class BusFlipProcessor:
                 })
         
         self.requirement_lookup = pd.DataFrame(expanded_rows)
+        
+        if not self.requirement_lookup.empty:
+            print(f"Loaded {len(self.requirement_lookup)} requirement-test case mappings")
+        else:
+            print("Warning: No valid requirement-test case mappings found")
     
     def _process_parquet(self):
         """
@@ -467,17 +475,17 @@ class BusFlipProcessor:
         """
         Get requirements for a test case, handling combined test cases.
         
-        :param test_case: Test case name (may be combined like "TC-001&TC-002")
+        :param test_case: Test case name (may be combined like "UYP109&TS2-0043")
         :return: Comma-separated list of requirements
         
         Splits combined test cases and looks up requirements for each
         individual test case in the requirement lookup table.
         """
-        if pd.isna(test_case):
+        if pd.isna(test_case) or test_case == '':
             return ''
         
-        # Split combined test cases on '&' or '&'
-        individual_test_cases = [tc.strip() for tc in str(test_case).replace('&', '&').split('&')]
+        # Split combined test cases on '&'
+        individual_test_cases = [tc.strip() for tc in str(test_case).split('&') if tc.strip()]
         
         all_requirements = []
         for tc in individual_test_cases:
@@ -486,8 +494,8 @@ class BusFlipProcessor:
             ]['requirement'].tolist()
             all_requirements.extend(reqs)
         
-        # Remove duplicates and return as comma-separated string
-        unique_reqs = list(dict.fromkeys(all_requirements))  # Preserves order
+        # Remove duplicates while preserving order
+        unique_reqs = list(dict.fromkeys(all_requirements))
         return ', '.join(unique_reqs) if unique_reqs else ''
     
     def _write_location_summary(self, flips_df: pd.DataFrame, writer):
