@@ -8,7 +8,7 @@ Detects bus flips, removes incorrect messages, and generates comprehensive track
 import pandas as pd
 import re
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 
 class BusFlipDetector:
@@ -138,10 +138,6 @@ class BusFlipProcessor:
         Parse bus log filename to extract unit_id, station, save.
         
         Format: unit_id_station_save_rtXX.csv
-        Examples: 
-            ABC123_L1_1_rt01.csv -> unit_id=ABC123, station=L1, save=1
-            ABC123_L1_100_rt01.csv -> unit_id=ABC123, station=L1, save=100
-            MY_UNIT_01_L2_56_rt02.csv -> unit_id=MY_UNIT_01, station=L2, save=56
         """
         name = filename.replace('.csv', '').replace('.CSV', '')
         parts = name.rsplit('_', 3)
@@ -171,24 +167,36 @@ class BusFlipProcessor:
         }
     
     def _strip_instance_suffix(self, test_case: str) -> str:
-        """
-        Remove trailing instance suffix (_01, _02, etc.) from test case name.
-        
-        Examples:
-            UYP1-2_02 -> UYP1-2
-            TRTY-0098_01 -> TRTY-0098
-            UYP1-2 -> UYP1-2 (unchanged)
-        """
-        # Only remove _XX where XX is exactly 2 digits at the end
+        """Remove trailing instance suffix (_01, _02, etc.) from test case name."""
         return re.sub(r'_\d{2}$', '', test_case)
     
-    def _load_test_cases(self):
+    def _parse_test_cases_from_filename(self, filename: str) -> List[str]:
         """
-        Load all test case source files.
+        Parse individual test cases from a source filename.
         
-        Handles combined test cases like "UYP1-2_02&TRTY-0098_01_Sources.csv"
-        by splitting them into individual test cases for requirement lookup.
+        Examples:
+            "UYP1-2_02_Sources.csv" -> ["UYP1-2"]
+            "UYP1-2_02&TRTY-0098_01_Sources.csv" -> ["UYP1-2", "TRTY-0098"]
         """
+        full_name = filename.replace("_Sources.csv", "").replace("_Sources", "")
+        
+        # Remove the final instance suffix (e.g., _01 at the very end)
+        parts = full_name.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            full_name = parts[0]
+        
+        # Split on '&' and strip instance suffixes from each
+        individual_test_cases = []
+        for tc in full_name.split('&'):
+            tc = tc.strip()
+            if tc:
+                tc_clean = self._strip_instance_suffix(tc)
+                individual_test_cases.append(tc_clean)
+        
+        return individual_test_cases
+    
+    def _load_test_cases(self):
+        """Load all test case source files."""
         print("\n[1/5] Loading test case sources...")
         
         dfs = []
@@ -209,32 +217,12 @@ class BusFlipProcessor:
                     print(f"  WARNING: {f.name} missing columns: {missing}")
                     continue
                 
-                # Parse test case name from filename
-                full_name = f.stem.replace("_Sources", "")
+                # Parse individual test cases from filename
+                individual_test_cases = self._parse_test_cases_from_filename(f.name)
                 
-                # Extract instance number (last _XX where XX is digits)
-                parts = full_name.rsplit('_', 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    test_case_combined = parts[0]
-                    instance = parts[1]
-                else:
-                    test_case_combined = full_name
-                    instance = "01"
-                
-                # Split combined test cases on '&' and remove instance suffixes
-                # "UYP1-2_02&TRTY-0098_01" -> ["UYP1-2", "TRTY-0098"]
-                individual_test_cases = []
-                for tc in test_case_combined.split('&'):
-                    tc = tc.strip()
-                    if tc:
-                        tc_clean = self._strip_instance_suffix(tc)
-                        individual_test_cases.append(tc_clean)
-                
-                df['test_case_combined'] = test_case_combined
-                df['test_case_instance'] = instance
-                df['test_case_full'] = full_name
+                # Create a row for each individual test case
                 df['source_file'] = f.name
-                df['individual_test_cases'] = [individual_test_cases] * len(df)
+                df['test_cases'] = [individual_test_cases] * len(df)
                 
                 # Normalize identifier columns
                 df['unit_id'] = df['unit_id'].astype(str).str.strip()
@@ -243,8 +231,7 @@ class BusFlipProcessor:
                 
                 dfs.append(df)
                 print(f"  Loaded: {f.name}")
-                print(f"    -> Combined: {test_case_combined}")
-                print(f"    -> Individual test cases: {individual_test_cases}")
+                print(f"    -> Test cases: {individual_test_cases}")
                 print(f"    -> Rows: {len(df)}")
                 
             except Exception as e:
@@ -254,10 +241,10 @@ class BusFlipProcessor:
             self.test_cases = pd.concat(dfs, ignore_index=True)
             print(f"\n  Total test case entries: {len(self.test_cases)}")
             
-            all_individual = set()
-            for tc_list in self.test_cases['individual_test_cases']:
-                all_individual.update(tc_list)
-            print(f"  Unique individual test cases: {sorted(all_individual)}")
+            all_test_cases = set()
+            for tc_list in self.test_cases['test_cases']:
+                all_test_cases.update(tc_list)
+            print(f"  Unique test cases: {sorted(all_test_cases)}")
         else:
             self.test_cases = pd.DataFrame()
             print("  WARNING: No valid test case data loaded")
@@ -292,10 +279,6 @@ class BusFlipProcessor:
         
         self.requirement_lookup = pd.DataFrame(expanded_rows)
         print(f"  Loaded {len(self.requirement_lookup)} requirement-test case mappings")
-        
-        if not self.requirement_lookup.empty:
-            print(f"  Unique requirements: {self.requirement_lookup['requirement'].nunique()}")
-            print(f"  Unique test cases in lookup: {self.requirement_lookup['test_case'].nunique()}")
     
     def _diagnose_data(self):
         """Print diagnostic info to help identify matching issues."""
@@ -323,7 +306,6 @@ class BusFlipProcessor:
         if self.test_cases is not None and not self.test_cases.empty:
             print("\n  TEST CASE SOURCES:")
             print(f"    Total entries: {len(self.test_cases)}")
-            print(f"    Timestamp range: {self.test_cases['timestamp_start'].min():.3f} - {self.test_cases['timestamp_end'].max():.3f}")
             
             tc_combos = set(zip(
                 self.test_cases['unit_id'], 
@@ -332,15 +314,8 @@ class BusFlipProcessor:
             ))
             
             matching = bus_log_combos & tc_combos
-            bus_only = bus_log_combos - tc_combos
-            tc_only = tc_combos - bus_log_combos
-            
             print(f"\n  MATCHING ANALYSIS:")
             print(f"    Matching combos: {len(matching)}")
-            if bus_only:
-                print(f"    In bus logs only: {len(bus_only)} combos")
-            if tc_only:
-                print(f"    In test cases only: {len(tc_only)} combos")
     
     def _process_bus_logs(self):
         """Process all bus log CSVs from the Bus Logs folder."""
@@ -422,9 +397,8 @@ class BusFlipProcessor:
         row = df.iloc[flip_idx]
         msg_type = self._extract_msg_type(row.get('decoded_description', ''))
         
-        test_case_combined, individual_test_cases = self._find_test_case(
-            row['timestamp'], unit_id, station, save
-        )
+        # Find test cases for this timestamp
+        test_cases = self._find_test_cases(row['timestamp'], unit_id, station, save)
         
         correct_idx = None
         correct_bus = None
@@ -437,19 +411,36 @@ class BusFlipProcessor:
         if correct_idx is not None:
             correct_bus = df.iloc[correct_idx]['bus']
         
-        self.flip_records.append({
-            'unit_id': unit_id,
-            'station': station,
-            'save': save,
-            'msg_type': msg_type,
-            'decoded_description': row.get('decoded_description', ''),
-            'timestamp': row['timestamp'],
-            'group_index': flip_idx,
-            'incorrect_bus': row['bus'],
-            'correct_bus': correct_bus,
-            'test_case_combined': test_case_combined,
-            'individual_test_cases': individual_test_cases
-        })
+        # Create a record for each test case (or one with None if no test case)
+        if test_cases:
+            for tc in test_cases:
+                self.flip_records.append({
+                    'unit_id': unit_id,
+                    'station': station,
+                    'save': save,
+                    'grouping': f"{unit_id}_{station}_{save}",
+                    'msg_type': msg_type,
+                    'decoded_description': row.get('decoded_description', ''),
+                    'timestamp': row['timestamp'],
+                    'group_index': flip_idx,
+                    'incorrect_bus': row['bus'],
+                    'correct_bus': correct_bus,
+                    'test_case': tc
+                })
+        else:
+            self.flip_records.append({
+                'unit_id': unit_id,
+                'station': station,
+                'save': save,
+                'grouping': f"{unit_id}_{station}_{save}",
+                'msg_type': msg_type,
+                'decoded_description': row.get('decoded_description', ''),
+                'timestamp': row['timestamp'],
+                'group_index': flip_idx,
+                'incorrect_bus': row['bus'],
+                'correct_bus': correct_bus,
+                'test_case': None
+            })
     
     def _extract_msg_type(self, desc: str) -> Optional[str]:
         """Extract message type from decoded description."""
@@ -458,11 +449,11 @@ class BusFlipProcessor:
         match = re.search(r'\[\s*([^\]]+)\s*\]', str(desc))
         return match.group(1) if match else None
     
-    def _find_test_case(self, timestamp: float, unit_id: str, 
-                        station: str, save: str) -> Tuple[Optional[str], list]:
-        """Find which test case was running at a given timestamp."""
+    def _find_test_cases(self, timestamp: float, unit_id: str, 
+                         station: str, save: str) -> List[str]:
+        """Find which test cases were running at a given timestamp."""
         if self.test_cases is None or self.test_cases.empty:
-            return None, []
+            return []
         
         matches = self.test_cases[
             (self.test_cases['unit_id'] == str(unit_id)) &
@@ -473,122 +464,19 @@ class BusFlipProcessor:
         ]
         
         if matches.empty:
-            return None, []
+            return []
         
-        combined = matches.iloc[0]['test_case_combined']
-        individual = matches.iloc[0]['individual_test_cases']
+        # Collect all test cases from matching rows
+        all_test_cases = []
+        for tc_list in matches['test_cases']:
+            if isinstance(tc_list, list):
+                all_test_cases.extend(tc_list)
         
-        return combined, individual if isinstance(individual, list) else []
+        return list(set(all_test_cases))
     
-    def _save_outputs(self):
-        """Save all output files including parquet and Excel summaries."""
-        print("\n[5/5] Saving outputs...")
-        
-        if not self.flip_records:
-            print("  No flips detected - skipping summary generation")
-            return
-        
-        flips_df = pd.DataFrame(self.flip_records)
-        
-        flips_df['individual_test_cases_str'] = flips_df['individual_test_cases'].apply(
-            lambda x: ', '.join(x) if isinstance(x, list) else ''
-        )
-        
-        parquet_path = self.output_dir / "bus_flips.parquet"
-        flips_df.to_parquet(parquet_path, index=False)
-        print(f"  Saved: {parquet_path}")
-        
-        excel_path = self.output_dir / "bus_flip_summary.xlsx"
-        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-            self._write_bus_flip_index(flips_df, writer)
-            self._write_test_case_summary(flips_df, writer)
-            self._write_individual_test_case_summary(flips_df, writer)
-            self._write_location_summary(flips_df, writer)
-            self._write_msg_type_summary(flips_df, writer)
-        print(f"  Saved: {excel_path}")
-        
-        mapped = flips_df['test_case_combined'].notna().sum()
-        unmapped = flips_df['test_case_combined'].isna().sum()
-        print(f"\n  Test case mapping:")
-        print(f"    Flips mapped to test cases: {mapped}")
-        print(f"    Flips without test case: {unmapped}")
-    
-    def _write_bus_flip_index(self, flips_df: pd.DataFrame, writer):
-        """Write detailed bus flip index to Excel."""
-        index_df = flips_df[[
-            'unit_id', 'station', 'save', 'group_index', 
-            'msg_type', 'decoded_description', 'timestamp',
-            'incorrect_bus', 'correct_bus', 
-            'test_case_combined', 'individual_test_cases_str'
-        ]].copy()
-        
-        index_df = index_df.rename(columns={'individual_test_cases_str': 'individual_test_cases'})
-        index_df = index_df.sort_values(['unit_id', 'station', 'save', 'group_index'])
-        index_df.to_excel(writer, sheet_name='Bus Flip Index', index=False)
-    
-    def _write_test_case_summary(self, flips_df: pd.DataFrame, writer):
-        """Write combined test case summary to Excel."""
-        tc_summary = flips_df.groupby('test_case_combined').agg(
-            total_flips=('timestamp', 'count'),
-            unique_locations=('unit_id', 'nunique'),
-            unique_msg_types=('msg_type', 'nunique')
-        ).reset_index()
-        
-        tc_summary = tc_summary.sort_values('total_flips', ascending=False)
-        tc_summary.to_excel(writer, sheet_name='By Combined Test Case', index=False)
-        
-        pivot = flips_df.pivot_table(
-            index='test_case_combined',
-            columns=['unit_id', 'station', 'save'],
-            values='timestamp',
-            aggfunc='count',
-            fill_value=0
-        )
-        pivot.columns = ['_'.join(map(str, c)) for c in pivot.columns]
-        pivot.reset_index().to_excel(writer, sheet_name='Test Case by Location', index=False)
-    
-    def _write_individual_test_case_summary(self, flips_df: pd.DataFrame, writer):
-        """Write summary by individual test cases (split from combined)."""
-        rows = []
-        for _, row in flips_df.iterrows():
-            individual_tcs = row['individual_test_cases']
-            if isinstance(individual_tcs, list) and individual_tcs:
-                for tc in individual_tcs:
-                    rows.append({
-                        'individual_test_case': tc,
-                        'unit_id': row['unit_id'],
-                        'station': row['station'],
-                        'save': row['save'],
-                        'msg_type': row['msg_type'],
-                        'timestamp': row['timestamp']
-                    })
-        
-        if not rows:
-            pd.DataFrame(columns=[
-                'individual_test_case', 'total_flips', 'unique_locations', 
-                'unique_msg_types', 'requirements'
-            ]).to_excel(writer, sheet_name='By Individual Test Case', index=False)
-            return
-        
-        individual_df = pd.DataFrame(rows)
-        
-        tc_summary = individual_df.groupby('individual_test_case').agg(
-            total_flips=('timestamp', 'count'),
-            unique_locations=('unit_id', 'nunique'),
-            unique_msg_types=('msg_type', 'nunique')
-        ).reset_index()
-        
-        if self.requirement_lookup is not None and not self.requirement_lookup.empty:
-            tc_summary['requirements'] = tc_summary['individual_test_case'].apply(
-                self._get_requirements_for_single_test_case
-            )
-        
-        tc_summary = tc_summary.sort_values('total_flips', ascending=False)
-        tc_summary.to_excel(writer, sheet_name='By Individual Test Case', index=False)
-    
-    def _get_requirements_for_single_test_case(self, test_case: str) -> str:
-        """Get requirements for a single test case."""
-        if pd.isna(test_case) or test_case == '' or self.requirement_lookup.empty:
+    def _get_requirements(self, test_case: str) -> str:
+        """Get requirements for a test case."""
+        if pd.isna(test_case) or test_case == '' or self.requirement_lookup is None or self.requirement_lookup.empty:
             return ''
         
         reqs = self.requirement_lookup[
@@ -598,11 +486,170 @@ class BusFlipProcessor:
         unique_reqs = list(dict.fromkeys(reqs))
         return ', '.join(unique_reqs) if unique_reqs else ''
     
+    def _save_outputs(self):
+        """Save all output files including parquet and Excel summaries."""
+        print("\n[5/5] Saving outputs...")
+        
+        # Collect all groupings from processed files (including those with 0 flips)
+        all_groupings = set()
+        for f in self.bus_logs_dir.glob("*.csv"):
+            parsed = self._parse_bus_log_filename(f.name)
+            if parsed:
+                all_groupings.add(f"{parsed['unit_id']}_{parsed['station']}_{parsed['save']}")
+        
+        if not self.flip_records:
+            print("  No flips detected")
+            flips_df = pd.DataFrame(columns=[
+                'unit_id', 'station', 'save', 'grouping', 'msg_type',
+                'decoded_description', 'timestamp', 'group_index',
+                'incorrect_bus', 'correct_bus', 'test_case'
+            ])
+        else:
+            flips_df = pd.DataFrame(self.flip_records)
+        
+        parquet_path = self.output_dir / "bus_flips.parquet"
+        flips_df.to_parquet(parquet_path, index=False)
+        print(f"  Saved: {parquet_path}")
+        
+        excel_path = self.output_dir / "bus_flip_summary.xlsx"
+        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+            self._write_bus_flip_index(flips_df, writer, all_groupings)
+            self._write_test_case_summary(flips_df, writer)
+            self._write_location_summary(flips_df, writer)
+            self._write_msg_type_summary(flips_df, writer)
+        print(f"  Saved: {excel_path}")
+        
+        mapped = flips_df['test_case'].notna().sum() if len(flips_df) > 0 else 0
+        unmapped = flips_df['test_case'].isna().sum() if len(flips_df) > 0 else 0
+        print(f"\n  Test case mapping:")
+        print(f"    Flips mapped to test cases: {mapped}")
+        print(f"    Flips without test case: {unmapped}")
+    
+    def _write_bus_flip_index(self, flips_df: pd.DataFrame, writer, all_groupings: set):
+        """
+        Write bus flip index to Excel.
+        
+        Shows for each grouping:
+        - Total flip count (can be 0)
+        - List of timestamps where flips occurred
+        - Count of A->B and B->A flips
+        - Message types affected with counts
+        - Index locations matching timestamps
+        """
+        summary_rows = []
+        
+        for grouping in sorted(all_groupings):
+            grp_flips = flips_df[flips_df['grouping'] == grouping]
+            
+            flip_count = len(grp_flips)
+            
+            if flip_count > 0:
+                # Get timestamps and indices (deduplicated, sorted)
+                grp_unique = grp_flips.drop_duplicates(subset=['timestamp', 'group_index'])
+                grp_unique = grp_unique.sort_values('group_index')
+                
+                timestamps = grp_unique['timestamp'].tolist()
+                indices = grp_unique['group_index'].tolist()
+                
+                # Count A->B and B->A flips
+                a_to_b = len(grp_unique[
+                    (grp_unique['incorrect_bus'].str.upper() == 'A') & 
+                    (grp_unique['correct_bus'].str.upper() == 'B')
+                ])
+                b_to_a = len(grp_unique[
+                    (grp_unique['incorrect_bus'].str.upper() == 'B') & 
+                    (grp_unique['correct_bus'].str.upper() == 'A')
+                ])
+                
+                # Message types with counts
+                msg_counts = grp_unique['msg_type'].value_counts()
+                msg_types_str = ', '.join([
+                    f"{msg} ({count})" for msg, count in msg_counts.items() if pd.notna(msg)
+                ])
+                
+                timestamps_str = ', '.join([str(t) for t in timestamps])
+                indices_str = ', '.join([str(i) for i in indices])
+            else:
+                timestamps_str = ''
+                indices_str = ''
+                a_to_b = 0
+                b_to_a = 0
+                msg_types_str = ''
+            
+            summary_rows.append({
+                'grouping': grouping,
+                'flip_count': flip_count,
+                'a_to_b_count': a_to_b,
+                'b_to_a_count': b_to_a,
+                'message_types': msg_types_str,
+                'timestamps': timestamps_str,
+                'index_locations': indices_str
+            })
+        
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df = summary_df.sort_values('flip_count', ascending=False)
+        summary_df.to_excel(writer, sheet_name='Bus Flip Index', index=False)
+    
+    def _write_test_case_summary(self, flips_df: pd.DataFrame, writer):
+        """
+        Write test case summary to Excel.
+        
+        Shows for each test case:
+        - Requirements mapped to it
+        - Groupings affected
+        - Message types per grouping
+        """
+        # Filter to only rows with test cases
+        tc_df = flips_df[flips_df['test_case'].notna()].copy()
+        
+        if tc_df.empty:
+            pd.DataFrame(columns=[
+                'test_case', 'requirements', 'total_flips', 
+                'groupings_affected', 'message_types_by_grouping'
+            ]).to_excel(writer, sheet_name='By Test Case', index=False)
+            return
+        
+        # Build summary for each test case
+        summary_rows = []
+        for test_case in tc_df['test_case'].unique():
+            tc_data = tc_df[tc_df['test_case'] == test_case]
+            
+            # Get requirements
+            requirements = self._get_requirements(test_case)
+            
+            # Get groupings affected
+            groupings = tc_data['grouping'].unique().tolist()
+            
+            # Get message types per grouping
+            msg_types_by_grouping = {}
+            for grouping in groupings:
+                grp_data = tc_data[tc_data['grouping'] == grouping]
+                msg_types = grp_data['msg_type'].dropna().unique().tolist()
+                msg_types_by_grouping[grouping] = msg_types
+            
+            # Format message types by grouping as string
+            msg_types_str = '; '.join([
+                f"{grp}: [{', '.join(msgs)}]" 
+                for grp, msgs in msg_types_by_grouping.items()
+            ])
+            
+            summary_rows.append({
+                'test_case': test_case,
+                'requirements': requirements,
+                'total_flips': len(tc_data),
+                'groupings_affected': ', '.join(groupings),
+                'message_types_by_grouping': msg_types_str
+            })
+        
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df = summary_df.sort_values('total_flips', ascending=False)
+        summary_df.to_excel(writer, sheet_name='By Test Case', index=False)
+    
     def _write_location_summary(self, flips_df: pd.DataFrame, writer):
         """Write location-based summary to Excel."""
         loc_summary = flips_df.groupby(['unit_id', 'station', 'save']).agg(
             total_flips=('timestamp', 'count'),
-            unique_test_cases=('test_case_combined', 'nunique'),
+            unique_test_cases=('test_case', 'nunique'),
             unique_msg_types=('msg_type', 'nunique')
         ).reset_index().sort_values('total_flips', ascending=False)
         
@@ -613,7 +660,7 @@ class BusFlipProcessor:
         msg_summary = flips_df.groupby('msg_type').agg(
             total_flips=('timestamp', 'count'),
             unique_locations=('unit_id', 'nunique'),
-            unique_test_cases=('test_case_combined', 'nunique')
+            unique_test_cases=('test_case', 'nunique')
         ).reset_index().sort_values('total_flips', ascending=False)
         
         msg_summary.to_excel(writer, sheet_name='By Message Type', index=False)
