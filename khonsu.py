@@ -206,11 +206,43 @@ class BusFlipProcessor:
         
         Enables linking flips to specific requirements, critical for understanding
         which system requirements may be impacted by bus flip issues.
+        
+        Handles requirement lookup where one requirement can map to multiple test cases
+        in a single cell (e.g., "TC-001, TC-002, TC-003" or "TC-001 TC-002").
         """
-        if self.requirement_lookup_path.exists():
-            self.requirement_lookup = pd.read_csv(self.requirement_lookup_path)
-        else:
-            self.requirement_lookup = pd.DataFrame(columns=['test_case', 'requirement'])
+        if not self.requirement_lookup_path.exists():
+            self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
+            return
+        
+        df = pd.read_csv(self.requirement_lookup_path)
+        
+        # Check column names (handle both "Test Cases" and "test_case")
+        test_case_col = None
+        for col in df.columns:
+            if col.lower().replace(' ', '_') in ['test_cases', 'test_case']:
+                test_case_col = col
+                break
+        
+        if test_case_col is None or 'Requirement' not in df.columns:
+            self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
+            return
+        
+        # Expand rows where multiple test cases are listed
+        expanded_rows = []
+        for _, row in df.iterrows():
+            requirement = row['Requirement']
+            test_cases_str = str(row[test_case_col])
+            
+            # Split on comma, space, or both
+            test_cases = [tc.strip() for tc in test_cases_str.replace(',', ' ').split() if tc.strip()]
+            
+            for tc in test_cases:
+                expanded_rows.append({
+                    'requirement': requirement,
+                    'test_case': tc
+                })
+        
+        self.requirement_lookup = pd.DataFrame(expanded_rows)
     
     def _process_parquet(self):
         """
