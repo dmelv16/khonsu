@@ -539,15 +539,26 @@ class BusFlipProcessor:
         summary_rows = []
         
         for grouping in sorted(all_groupings):
+            # Parse grouping back to components
+            parts = grouping.rsplit('_', 2)
+            if len(parts) == 3:
+                unit_id, station, save = parts
+            else:
+                unit_id, station, save = grouping, '', ''
+            
             grp_flips = flips_df[flips_df['grouping'] == grouping]
             
-            flip_count = len(grp_flips)
-            
-            if flip_count > 0:
-                # Get timestamps and indices (deduplicated, sorted)
+            # Deduplicate by timestamp and group_index to get actual unique flips
+            # (removes duplicates caused by multiple test cases per flip)
+            if len(grp_flips) > 0:
                 grp_unique = grp_flips.drop_duplicates(subset=['timestamp', 'group_index'])
                 grp_unique = grp_unique.sort_values('group_index')
-                
+                flip_count = len(grp_unique)
+            else:
+                grp_unique = grp_flips
+                flip_count = 0
+            
+            if flip_count > 0:
                 timestamps = grp_unique['timestamp'].tolist()
                 indices = grp_unique['group_index'].tolist()
                 
@@ -577,7 +588,9 @@ class BusFlipProcessor:
                 msg_types_str = ''
             
             summary_rows.append({
-                'grouping': grouping,
+                'unit_id': unit_id,
+                'station': station,
+                'save': save,
                 'flip_count': flip_count,
                 'a_to_b_count': a_to_b,
                 'b_to_a_count': b_to_a,
