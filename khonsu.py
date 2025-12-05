@@ -207,8 +207,8 @@ class BusFlipProcessor:
         Enables linking flips to specific requirements, critical for understanding
         which system requirements may be impacted by bus flip issues.
         
-        Handles requirement lookup where one requirement can map to multiple test cases
-        in a single cell (e.g., "TC-001, TC-002, TC-003" or "TC-001 TC-002").
+        Expects CSV with columns: "Requirement" and "Test Cases"
+        Handles multiple test cases in a single cell (e.g., "TC-001, TC-002, TC-003").
         """
         if not self.requirement_lookup_path.exists():
             self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
@@ -216,14 +216,9 @@ class BusFlipProcessor:
         
         df = pd.read_csv(self.requirement_lookup_path)
         
-        # Check column names (handle both "Test Cases" and "test_case")
-        test_case_col = None
-        for col in df.columns:
-            if col.lower().replace(' ', '_') in ['test_cases', 'test_case']:
-                test_case_col = col
-                break
-        
-        if test_case_col is None or 'Requirement' not in df.columns:
+        # Verify expected columns exist
+        if 'Requirement' not in df.columns or 'Test Cases' not in df.columns:
+            print(f"Warning: Expected columns 'Requirement' and 'Test Cases' not found in {self.requirement_lookup_path}")
             self.requirement_lookup = pd.DataFrame(columns=['requirement', 'test_case'])
             return
         
@@ -231,7 +226,7 @@ class BusFlipProcessor:
         expanded_rows = []
         for _, row in df.iterrows():
             requirement = row['Requirement']
-            test_cases_str = str(row[test_case_col])
+            test_cases_str = str(row['Test Cases'])
             
             # Split on comma, space, or both
             test_cases = [tc.strip() for tc in test_cases_str.replace(',', ' ').split() if tc.strip()]
