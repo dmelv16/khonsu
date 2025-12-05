@@ -165,6 +165,10 @@ class BusFlipProcessor:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Create subdirectories
+        self.cleaned_logs_dir = self.output_dir / "cleaned_logs"
+        self.cleaned_logs_dir.mkdir(parents=True, exist_ok=True)
+        
         self.flip_records = []
         self.test_cases = None
         self.requirement_lookup = None
@@ -188,16 +192,37 @@ class BusFlipProcessor:
         Test cases provide timestamp ranges that map flips to specific test
         executions, enabling test-specific flip analysis.
         
-        Handles combined test cases (e.g., "TC-001&TC-002") by storing both
-        the combined form and splitting for requirement lookup.
+        Handles multiple formats:
+        - Single test case: "UYP109_01_Sources.csv" -> test_case_base="UYP109", instance="01"
+        - Combined test cases: "UYP109_01&TS2-0043_02_Sources.csv" -> splits into individual test cases
+        
+        The "_XX" suffix indicates different execution instances of the same test case.
+        Combined test cases (using &) are split for requirement lookup but tracked together.
         """
         dfs = []
         for f in self.test_case_dir.glob("*_Sources.csv"):
             df = pd.read_csv(f)
-            test_case_name = f.stem.replace("_Sources", "")
-            df['test_case_combined'] = test_case_name
-            df['test_case'] = test_case_name
+            
+            # Remove "_Sources.csv" to get the test case identifier
+            full_name = f.stem.replace("_Sources", "")
+            
+            # Parse the test case name
+            # Format: TestCase_XX or TestCase1_XX&TestCase2_XX
+            # Extract test case base and instance number
+            parts = full_name.rsplit('_', 1)
+            if len(parts) == 2:
+                test_case_combined = parts[0]
+                instance = parts[1]
+            else:
+                test_case_combined = full_name
+                instance = "01"
+            
+            df['test_case_combined'] = test_case_combined
+            df['test_case_instance'] = instance
+            df['test_case_full'] = full_name
+            
             dfs.append(df)
+        
         self.test_cases = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     
     def _load_requirement_lookup(self):
@@ -342,11 +367,12 @@ class BusFlipProcessor:
         :param unit_id: Unit identifier
         :param station: Station identifier
         :param save: Save identifier
-        :return: Test case name (combined form if applicable) or None
+        :return: Test case name (combined form without instance suffix) or None
         
         Links flips to specific test executions, enabling test-specific
         analysis and requirement impact assessment. Returns the combined
-        test case name (e.g., "TC-001&TC-002") as it appears in the source files.
+        test case name (e.g., "UYP109" or "UYP109&TS2-0043") without the
+        instance suffix (_01, _02, etc.) for proper requirement lookup.
         """
         if self.test_cases.empty:
             return None
